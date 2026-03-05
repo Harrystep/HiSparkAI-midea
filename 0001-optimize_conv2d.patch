@@ -1,0 +1,231 @@
+From 7afa75122479d8455b35bfedb61fd488f55275a5 Mon Sep 17 00:00:00 2001
+From: gupengcheng0401 <gupengcheng4@huawei.com>
+Date: Thu, 5 Mar 2026 21:52:19 +0800
+Subject: [PATCH] optimize_conv2d
+
+---
+ .../cpu/nnacl_c/int8/conv3x3_int8_riscv.c     | 115 ++++++++++++++++++
+ .../cpu/nnacl_c/int8/conv3x3_int8_riscv.h     |  57 +++++++++
+ .../nnacl/int8/conv2d_3x3_int8_coder.cc       |   7 +-
+ 3 files changed, 178 insertions(+), 1 deletion(-)
+ create mode 100644 mindspore-lite/src/litert/kernel/cpu/nnacl_c/int8/conv3x3_int8_riscv.c
+ create mode 100644 mindspore-lite/src/litert/kernel/cpu/nnacl_c/int8/conv3x3_int8_riscv.h
+
+diff --git a/mindspore-lite/src/litert/kernel/cpu/nnacl_c/int8/conv3x3_int8_riscv.c b/mindspore-lite/src/litert/kernel/cpu/nnacl_c/int8/conv3x3_int8_riscv.c
+new file mode 100644
+index 00000000..09257f42
+--- /dev/null
++++ b/mindspore-lite/src/litert/kernel/cpu/nnacl_c/int8/conv3x3_int8_riscv.c
+@@ -0,0 +1,115 @@
++/**
++ * Copyright 2025 Huawei Technologies Co., Ltd
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "nnacl_c/int8/conv3x3_int8_riscv.h"
++#include <string.h>
++
++// 内联边界检查宏 - 避免函数调用开销
++#define GET_INPUT(input_ptr, iy, ix, ic, H, W, C, zp) \
++  (((iy) >= 0 && (iy) < (H) && (ix) >= 0 && (ix) < (W)) ? (input_ptr[((iy) * (W) + (ix)) * (C) + (ic)] - (zp)) : (-(zp)))
++
++// 滤波器访问宏 - [OC, IC, 3, 3]格式
++#define FILTER_OC_IC(filter, oc, ic, h, w, input_c) (filter[(oc) * (input_c) * 9 + (ic) * 9 + (h) * 3 + (w)])
++
++void Conv3x3Int8Riscv(const int8_t *input, int8_t *output, const int8_t *filter, const int32_t *bias,
++                      int32_t input_zp, const int32_t *quant_scale, int32_t output_zp, uint32_t quant_num,
++                      const int *input_dims, const int *output_dims) {
++  const int batch = input_dims[0];
++  const int input_h = input_dims[1];
++  const int input_w = input_dims[2];
++  const int input_c = input_dims[3];
++
++  const int output_h = output_dims[1];
++  const int output_w = output_dims[2];
++  const int output_c = output_dims[3];
++
++  // 激活函数范围（int8范围）
++  const int32_t output_activation_min = -128;
++  const int32_t output_activation_max = 127;
++
++  // 处理每个batch
++  for (int b = 0; b < batch; b++) {
++    const int8_t *batch_input = input + b * input_h * input_w * input_c;
++    int8_t *batch_output = output + b * output_h * output_w * output_c;
++
++    // 处理每个输出通道
++    for (int oc = 0; oc < output_c; oc++) {
++      // 处理每个输出位置
++      for (int oy = 0; oy < output_h; oy++) {
++        for (int ox = 0; ox < output_w; ox++) {
++          // 初始化累加器
++          int32_t acc = bias[oc];
++
++          // 3x3内核完全展开 - 无嵌套循环
++          // 这是最内层循环，只保留输入通道循环
++          for (int ic = 0; ic < input_c; ic++) {
++            // 加载9个滤波器值
++            int8_t f00 = FILTER_OC_IC(filter, oc, ic, 0, 0, input_c);
++            int8_t f01 = FILTER_OC_IC(filter, oc, ic, 0, 1, input_c);
++            int8_t f02 = FILTER_OC_IC(filter, oc, ic, 0, 2, input_c);
++            int8_t f10 = FILTER_OC_IC(filter, oc, ic, 1, 0, input_c);
++            int8_t f11 = FILTER_OC_IC(filter, oc, ic, 1, 1, input_c);
++            int8_t f12 = FILTER_OC_IC(filter, oc, ic, 1, 2, input_c);
++            int8_t f20 = FILTER_OC_IC(filter, oc, ic, 2, 0, input_c);
++            int8_t f21 = FILTER_OC_IC(filter, oc, ic, 2, 1, input_c);
++            int8_t f22 = FILTER_OC_IC(filter, oc, ic, 2, 2, input_c);
++
++            // 输入原点位置（padding=1）
++            int iy_base = oy - 1;
++            int ix_base = ox - 1;
++
++            // 加载9个输入值（带边界检查）
++            int32_t i00 = GET_INPUT(batch_input, iy_base + 0, ix_base + 0, ic, input_h, input_w, input_c, input_zp);
++            int32_t i01 = GET_INPUT(batch_input, iy_base + 0, ix_base + 1, ic, input_h, input_w, input_c, input_zp);
++            int32_t i02 = GET_INPUT(batch_input, iy_base + 0, ix_base + 2, ic, input_h, input_w, input_c, input_zp);
++            int32_t i10 = GET_INPUT(batch_input, iy_base + 1, ix_base + 0, ic, input_h, input_w, input_c, input_zp);
++            int32_t i11 = GET_INPUT(batch_input, iy_base + 1, ix_base + 1, ic, input_h, input_w, input_c, input_zp);
++            int32_t i12 = GET_INPUT(batch_input, iy_base + 1, ix_base + 2, ic, input_h, input_w, input_c, input_zp);
++            int32_t i20 = GET_INPUT(batch_input, iy_base + 2, ix_base + 0, ic, input_h, input_w, input_c, input_zp);
++            int32_t i21 = GET_INPUT(batch_input, iy_base + 2, ix_base + 1, ic, input_h, input_w, input_c, input_zp);
++            int32_t i22 = GET_INPUT(batch_input, iy_base + 2, ix_base + 2, ic, input_h, input_w, input_c, input_zp);
++
++            // MAC操作 - 完全展开（9次乘法）
++            acc += f00 * i00;
++            acc += f01 * i01;
++            acc += f02 * i02;
++            acc += f10 * i10;
++            acc += f11 * i11;
++            acc += f12 * i12;
++            acc += f20 * i20;
++            acc += f21 * i21;
++            acc += f22 * i22;
++          }
++
++          // Per-channel量化 - 使用简化的缩放
++          // quant_scale[oc] 包含了该通道的量化缩放因子
++          int32_t scaled = (acc * quant_scale[oc] + (1 << 15)) >> 16;  // 简化的requantization
++          scaled += output_zp;
++
++          // 激活函数（clamp）
++          if (scaled < output_activation_min) {
++            scaled = output_activation_min;
++          } else if (scaled > output_activation_max) {
++            scaled = output_activation_max;
++          }
++
++          // 存储输出（NHWC格式）
++          batch_output[(oy * output_w + ox) * output_c + oc] = (int8_t)scaled;
++        }
++      }
++    }
++  }
++}
+diff --git a/mindspore-lite/src/litert/kernel/cpu/nnacl_c/int8/conv3x3_int8_riscv.h b/mindspore-lite/src/litert/kernel/cpu/nnacl_c/int8/conv3x3_int8_riscv.h
+new file mode 100644
+index 00000000..76a6338e
+--- /dev/null
++++ b/mindspore-lite/src/litert/kernel/cpu/nnacl_c/int8/conv3x3_int8_riscv.h
+@@ -0,0 +1,57 @@
++/**
++ * Copyright 2025 Huawei Technologies Co., Ltd
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef MINDSPORE_LITE_SRC_LITERT_KERNEL_CPU_NNACL_C_INT8_CONV3X3_INT8_RISCV_H_
++#define MINDSPORE_LITE_SRC_LITERT_KERNEL_CPU_NNACL_C_INT8_CONV3X3_INT8_RISCV_H_
++
++#include <stdint.h>
++#include "nnacl_c/int8/quantize.h"
++#include "nnacl_c/int8/fixed_point.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @brief RISCV优化的3x3卷积算子（无Pack，最少循环）
++ *
++ * 特性：
++ * - 直接在NHWC格式操作，无Pack变换
++ * - 3x3内核完全展开（9次显式MAC）
++ * - 零额外RAM消耗（无临时buffer）
++ * - 最小化FLASH消耗（无Pack代码）
++ * - 仅4层循环嵌套（batch, oc, oy, ox）
++ *
++ * @param input 输入张量，NHWC格式 [N, H, W, IC]
++ * @param output 输出张量，NHWC格式 [N, OH, OW, OC]
++ * @param filter 滤波器 [OC, IC, 3, 3]
++ * @param bias 偏置 [OC]
++ * @param input_zp 输入零点
++ * @param quant_scale 量化scale数组 [output_c]
++ * @param output_zp 输出零点
++ * @param quant_num 量化参数数量（通常为output_channel）
++ * @param input_dims 输入维度 [N, H, W, IC]
++ * @param output_dims 输出维度 [N, OH, OW, OC]
++ */
++void Conv3x3Int8Riscv(const int8_t *input, int8_t *output, const int8_t *filter, const int32_t *bias,
++                      int32_t input_zp, const int32_t *quant_scale, int32_t output_zp, uint32_t quant_num,
++                      const int *input_dims, const int *output_dims);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif  // MINDSPORE_LITE_SRC_LITERT_KERNEL_CPU_NNACL_C_INT8_CONV3X3_INT8_RISCV_H_
+diff --git a/mindspore-lite/tools/converter/micro/coder/opcoders/nnacl/int8/conv2d_3x3_int8_coder.cc b/mindspore-lite/tools/converter/micro/coder/opcoders/nnacl/int8/conv2d_3x3_int8_coder.cc
+index 710813e3..2f736798 100644
+--- a/mindspore-lite/tools/converter/micro/coder/opcoders/nnacl/int8/conv2d_3x3_int8_coder.cc
++++ b/mindspore-lite/tools/converter/micro/coder/opcoders/nnacl/int8/conv2d_3x3_int8_coder.cc
+@@ -248,12 +248,14 @@ int Conv2D3x3Int8Coder::DoCode(CoderContext *const context) {
+             {
+               "nnacl_c/int8/conv_int8.h",
+               "nnacl_c/int8/conv3x3_int8.h",
++              "nnacl_c/int8/conv3x3_int8_riscv.h",
+             },
+             {
+               "pack_int8.c",
+               "conv_int8.c",
+               "conv3x3_int8.c",
+               "conv3x3_int8_low_memory.c",
++              "conv3x3_int8_riscv.c",
+               "fixed_point.c",
+             });
+   }
+@@ -297,7 +299,10 @@ int Conv2D3x3Int8Coder::DoCode(CoderContext *const context) {
+     code.CodeStruct(scale_ratio_name, conv_quant_args);
+     code.CodeArray<int>("input_shape", input_tensor_shape.data(), input_tensor_shape.size(), true);
+     code.CodeArray<int>("output_shape", output_tensor_shape.data(), output_tensor_shape.size(), true);
+-    code.CodeFunction("Conv3x3Int8OptimzedForOutC", input_tensor_, output_tensor_, filter_addr_, bias_addr_, input_zp,
++
++    // Call new RISCV optimized function (no pack, 3x3 unrolled)
++    // Using same parameter format as old function for compatibility
++    code.CodeFunction("Conv3x3Int8Riscv", input_tensor_, output_tensor_, filter_addr_, bias_addr_, input_zp,
+                       scale_ratio_name, output_zp, quant_num, "input_shape", "output_shape");
+   }
+   context->AppendCode(code.str());
+-- 
+2.34.1
+
