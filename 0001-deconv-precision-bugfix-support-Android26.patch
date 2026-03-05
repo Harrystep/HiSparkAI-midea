@@ -1,0 +1,141 @@
+From 371deaf699393d99a5fb5d38136dff3ddf1e3cda Mon Sep 17 00:00:00 2001
+From: gupengcheng0401 <gupengcheng4@huawei.com>
+Date: Tue, 10 Feb 2026 21:05:57 +0800
+Subject: [PATCH] deconv precision bugfix && support Android26
+
+---
+ cmake/external_libs/flatbuffers.cmake         |  6 ++++
+ mindspore-lite/CMakeLists.txt                 |  4 +++
+ .../nnacl_c/kernel/deconvolution_winograd.c   |  4 ---
+ mindspore-lite/tools/benchmark/CMakeLists.txt |  2 +-
+ .../fusion/batchnorm_to_scale_fusion.cc       | 29 ++++++++++++++++++-
+ scripts/build/build_lite.sh                   |  2 +-
+ 6 files changed, 40 insertions(+), 7 deletions(-)
+
+diff --git a/cmake/external_libs/flatbuffers.cmake b/cmake/external_libs/flatbuffers.cmake
+index 96162bd1..deebc6e8 100644
+--- a/cmake/external_libs/flatbuffers.cmake
++++ b/cmake/external_libs/flatbuffers.cmake
+@@ -24,6 +24,12 @@ else()
+         set(flatbuffers_CFLAGS "-fPIC -fPIE -D_FORTIFY_SOURCE=2 -O2 -fstack-protector-strong")
+     endif()
+ 
++    if(ANDROID)
++        # fix flatbuffers unused error when build with android >= 26
++        set(flatbuffers_CFLAGS "-Wno-error=unused-but-set-variable")
++        set(flatbuffers_CXXFLAGS "-Wno-error=unused-but-set-variable")
++    endif()
++
+     if(WIN32)
+         set(flatbuffers_USE_STATIC_LIBS ON)
+     endif()
+diff --git a/mindspore-lite/CMakeLists.txt b/mindspore-lite/CMakeLists.txt
+index f177b401..76c501dd 100644
+--- a/mindspore-lite/CMakeLists.txt
++++ b/mindspore-lite/CMakeLists.txt
+@@ -115,6 +115,10 @@ if(DEFINED ENV{MSLITE_ENABLE_CLOUD_FUSION_INFERENCE})
+     set(MSLITE_ENABLE_CLOUD_FUSION_INFERENCE $ENV{MSLITE_ENABLE_CLOUD_FUSION_INFERENCE})
+ endif()
+ 
++if(DEFINED ENV{MSLITE_GPU_BACKEND})
++    set(MSLITE_GPU_BACKEND $ENV{MSLITE_GPU_BACKEND})
++endif()
++
+ if(DEFINED ENV{MSLITE_TARGET_RISCV})
+     set(MSLITE_TARGET_RISCV $ENV{MSLITE_TARGET_RISCV})
+ endif()
+diff --git a/mindspore-lite/src/litert/kernel/cpu/nnacl_c/kernel/deconvolution_winograd.c b/mindspore-lite/src/litert/kernel/cpu/nnacl_c/kernel/deconvolution_winograd.c
+index 727cbc19..8dcf38af 100644
+--- a/mindspore-lite/src/litert/kernel/cpu/nnacl_c/kernel/deconvolution_winograd.c
++++ b/mindspore-lite/src/litert/kernel/cpu/nnacl_c/kernel/deconvolution_winograd.c
+@@ -463,10 +463,6 @@ int DeConvWinogradResize(KernelBase *self) {
+   }
+ 
+   NNACL_CHECK_INT_MUL_NOT_OVERFLOW(deconv->conv_.compute_.out_hw_, deconv->conv_.compute_.out_c_, NNACL_ERR);
+-  int output_chw = deconv->conv_.compute_.out_hw_ * deconv->conv_.compute_.out_c_;
+-  if (output_chw <= kDeconvWinogradMaxPixel) {
+-    self->thread_nr_ = NNACL_MIN(self->thread_nr_, Num3);
+-  }
+   return NNACL_OK;
+ }
+ 
+diff --git a/mindspore-lite/tools/benchmark/CMakeLists.txt b/mindspore-lite/tools/benchmark/CMakeLists.txt
+index 5a22fd12..7b5f5924 100644
+--- a/mindspore-lite/tools/benchmark/CMakeLists.txt
++++ b/mindspore-lite/tools/benchmark/CMakeLists.txt
+@@ -120,4 +120,4 @@ endif()
+ 
+ add_dependencies(benchmark fbs_src)
+ 
+-target_link_libraries(benchmark ${BENCHMARK_LINK_LIB})
++target_link_libraries(benchmark PRIVATE ${BENCHMARK_LINK_LIB})
+diff --git a/mindspore-lite/tools/optimizer/fusion/batchnorm_to_scale_fusion.cc b/mindspore-lite/tools/optimizer/fusion/batchnorm_to_scale_fusion.cc
+index b71db7ac..af3e4e63 100644
+--- a/mindspore-lite/tools/optimizer/fusion/batchnorm_to_scale_fusion.cc
++++ b/mindspore-lite/tools/optimizer/fusion/batchnorm_to_scale_fusion.cc
+@@ -28,6 +28,7 @@
+ #include "nnacl_c/op_base.h"
+ #include "ops_utils/op_utils.h"
+ #include "src/common/utils.h"
++#include "tools/optimizer/common/format_utils.h"
+ #include "mindspore/ops/op_def/auto_generate/gen_ops_primitive_b.h"
+ #include "mindspore/ops/op_def/auto_generate/gen_ops_primitive_f.h"
+ #include "mindspore/ops/op_def/auto_generate/gen_ops_primitive_t.h"
+@@ -235,6 +236,27 @@ int CalculateScaleAndBiasFromBN(const CNodePtr &bn_node, int kernel_num, float *
+   return lite::RET_OK;
+ }
+ 
++int64_t CalculateAxisForScale(Format format, const tensor::TensorPtr &mean_tensor,
++                              const std::vector<int64_t> &input_shape) {
++  // Default axis based on format: NHWC uses -1 (last axis), others use 1 (second axis)
++  int64_t axis = format == NHWC ? -1 : 1;
++
++  // For 3D input (NCW format), adjust axis based on which dimension matches mean tensor size
++  // If mean size matches input_shape[2] (channel/width in NCW), axis = -1
++  // If mean size matches input_shape[1] (width in NCW), axis = 1
++  bool is_3d_input = input_shape.size() == DIMENSION_3D;
++  if (is_3d_input && mean_tensor != nullptr && mean_tensor->shape_c() != nullptr) {
++    bool match_channel_axis = mean_tensor->shape_c()[0] == input_shape[Num2];
++    bool match_width_axis = mean_tensor->shape_c()[0] == input_shape[Num1];
++    if (match_channel_axis) {
++      axis = -1;
++    } else if (match_width_axis) {
++      axis = 1;
++    }
++  }
++  return axis;
++}
++
+ bool BatchNormToScaleFusion::CheckBNCanFused(const AnfNodePtr &node) {
+   MS_ASSERT(node != nullptr);
+   if (!utils::isa<CNode>(node) ||
+@@ -338,7 +360,12 @@ bool BatchNormToScaleFusion::Run(const FuncGraphPtr &func_graph) {
+       return false;
+     }
+     MS_CHECK_TRUE_RET(!lite::JudgeDynamicShape(input_shape_), false);
+-    int64_t axis = input_shape_.size() == DIMENSION_4D ? -1 : 1;
++    Format format = NHWC;
++    if (DetermineCertainOutputFormat(cnode, 0, &format) != RET_OK) {
++      MS_LOG(ERROR) << "get output format failed";
++      return false;
++    }
++    int64_t axis = CalculateAxisForScale(format, mean_tensor, input_shape_);
+     scale_primitive->set_axis(axis);
+     scale_primitive->set_activation_type(ActivationType::NO_ACTIVATION);
+     auto scale_primitive_c = scale_primitive->GetPrim();
+diff --git a/scripts/build/build_lite.sh b/scripts/build/build_lite.sh
+index 03e3d9d3..a4f765b7 100755
+--- a/scripts/build/build_lite.sh
++++ b/scripts/build/build_lite.sh
+@@ -491,7 +491,7 @@ build_lite() {
+           fi
+           export PATH=${ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin:${ANDROID_NDK}/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin:${PATH}
+           CMAKE_TOOLCHAIN_FILE=${ANDROID_NDK}/build/cmake/android.toolchain.cmake
+-          LITE_CMAKE_ARGS="${LITE_CMAKE_ARGS} -DANDROID_NATIVE_API_LEVEL=19 -DANDROID_NDK=${ANDROID_NDK} -DANDROID_ABI=arm64-v8a -DANDROID_TOOLCHAIN_NAME=aarch64-linux-android-clang -DANDROID_STL=${MSLITE_ANDROID_STL}"
++          LITE_CMAKE_ARGS="${LITE_CMAKE_ARGS} -DANDROID_NATIVE_API_LEVEL=21 -DANDROID_NDK=${ANDROID_NDK} -DANDROID_ABI=arm64-v8a -DANDROID_TOOLCHAIN_NAME=aarch64-linux-android-clang -DANDROID_STL=${MSLITE_ANDROID_STL}"
+           LITE_CMAKE_ARGS="${LITE_CMAKE_ARGS} -DMSLITE_MINDDATA_IMPLEMENT=full"
+         fi
+         LITE_CMAKE_ARGS="${LITE_CMAKE_ARGS} -DMSLITE_ENABLE_FP16=on"
+-- 
+2.34.1
+
