@@ -19,6 +19,7 @@
 #include <functional>
 #include <algorithm>
 #include <memory>
+#include <unordered_map>
 #include "mindspore/ops/op_def/random_ops.h"
 #include "mindspore/ops/op_def/lite_ops.h"
 #include "mindspore/ops/op_def/array_ops.h"
@@ -649,26 +650,44 @@ bool OnnxInputAdjust::Adjust(const FuncGraphPtr &func_graph, const converter::Co
     keep_origin_dtype = env_var_value == "1";
   }
 
-  // Define adjustment handler using map with lambda to avoid long if-else chain
-  // Note: Constant and Transpose are handled separately due to special conditions
+  // Define adjustment handler function type
   using AdjustHandler = std::function<STATUS(const FuncGraphPtr &, const CNodePtr &, bool &)>;
-  const std::map<std::string, AdjustHandler> adjust_handlers = {
+
+  // Build unordered_map for O(1) lookup instead of O(n) if-else chain
+  // Note: Constant and Transpose handled separately due to special conditions
+  const std::unordered_map<std::string, AdjustHandler> adjust_handlers = {
     {prim::kPrimStridedSlice->name(),
-     [&](const auto &fg, const auto &cn, bool &flag) { return AdjustStridedSlice(fg, cn, keep_origin_dtype); }},
+     [&](const FuncGraphPtr &fg, const CNodePtr &cn, bool &need_update) -> STATUS {
+       return AdjustStridedSlice(fg, cn, keep_origin_dtype);
+     }},
     {prim::kPrimResize->name(),
-     [&](const auto &fg, const auto &cn, bool &flag) { return AdjustResize(&flag, cn); }},
+     [&](const FuncGraphPtr &fg, const CNodePtr &cn, bool &need_update) -> STATUS {
+       return AdjustResize(&need_update, cn);
+     }},
     {prim::kPrimRandomNormal->name(),
-     [&](const auto &fg, const auto &cn, bool &flag) { return AdjustRandomNormal(fg, cn); }},
+     [&](const FuncGraphPtr &fg, const CNodePtr &cn, bool &need_update) -> STATUS {
+       return AdjustRandomNormal(fg, cn);
+     }},
     {prim::kPrimGatherD->name(),
-     [&](const auto &fg, const auto &cn, bool &flag) { return AdjustGatherD(fg, cn); }},
+     [&](const FuncGraphPtr &fg, const CNodePtr &cn, bool &need_update) -> STATUS {
+       return AdjustGatherD(fg, cn);
+     }},
     {prim::kPrimUnsqueeze->name(),
-     [&](const auto &fg, const auto &cn, bool &flag) { return AdjustUnsqueeze(&flag, cn); }},
+     [&](const FuncGraphPtr &fg, const CNodePtr &cn, bool &need_update) -> STATUS {
+       return AdjustUnsqueeze(&need_update, cn);
+     }},
     {prim::kPrimROIAlign->name(),
-     [&](const auto &fg, const auto &cn, bool &flag) { return AdjustROIAlign(fg, cn); }},
+     [&](const FuncGraphPtr &fg, const CNodePtr &cn, bool &need_update) -> STATUS {
+       return AdjustROIAlign(fg, cn);
+     }},
     {prim::kPrimMultinomial->name(),
-     [&](const auto &fg, const auto &cn, bool &flag) { return AdjustMultinomial(fg, cn, &flag); }},
+     [&](const FuncGraphPtr &fg, const CNodePtr &cn, bool &need_update) -> STATUS {
+       return AdjustMultinomial(fg, cn, &need_update);
+     }},
     {prim::kPrimOneHot->name(),
-     [&](const auto &fg, const auto &cn, bool &flag) { return AdjustOneHot(fg, cn); }},
+     [&](const FuncGraphPtr &fg, const CNodePtr &cn, bool &need_update) -> STATUS {
+       return AdjustOneHot(fg, cn);
+     }},
   };
 
   for (auto &node : node_list) {
@@ -691,24 +710,28 @@ bool OnnxInputAdjust::Adjust(const FuncGraphPtr &func_graph, const converter::Co
       continue;
     }
 
-    // Process Constant
-    if (opt::CheckPrimitiveType(node, prim::kPrimConstant)) {
+    // Get primitive from CNode
+    auto prim = GetValueNode<PrimitivePtr>(cnode->input(0));
+    if (prim == nullptr) {
+      MS_LOG(DEBUG) << "cnode primitive is nullptr.";
+      continue;
+    }
+
+    // Process Constant (no special conditions)
+    if (prim->name() == prim::kPrimConstant->name()) {
       status = ReplaceConstant(func_graph, cnode, keep_origin_dtype);
     }
-    // Process Transpose with condition
-    else if (opt::CheckPrimitiveType(node, prim::kPrimTranspose)) {
+    // Process Transpose with special condition check
+    else if (prim->name() == prim::kPrimTranspose->name()) {
       if (flag.save_type != kMindIR) {
         status = ReplaceTransposeWithGraphInput(func_graph, cnode);
       }
     }
-    // Process other primitives using map lookup
+    // Process other primitives using unordered_map lookup (O(1) average)
     else {
-      auto prim = GetValueNode<PrimitivePtr>(cnode->input(0));
-      if (prim != nullptr) {
-        auto it = adjust_handlers.find(prim->name());
-        if (it != adjust_handlers.end()) {
-          status = it->second(func_graph, cnode, need_update_manager);
-        }
+      auto it = adjust_handlers.find(prim->name());
+      if (it != adjust_handlers.end()) {
+        status = it->second(func_graph, cnode, need_update_manager);
       }
     }
 
