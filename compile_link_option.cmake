@@ -8,23 +8,14 @@ else()
     string(REPLACE "-g" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
     string(REPLACE "-g" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 
-    # Detect GCC version for FORTIFY_SOURCE compatibility
-    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "11.0")
-            # GCC 11+ requires explicit undefine before redefine to avoid conflicts
-            set(FORTIFY_FLAGS "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2")
-        else()
-            # GCC 10 and earlier use standard FORTIFY_SOURCE=2
-            set(FORTIFY_FLAGS "-D_FORTIFY_SOURCE=2")
-        endif()
-    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0")
-            # Clang 13+ also requires explicit undefine
-            set(FORTIFY_FLAGS "-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2")
-        else()
-            set(FORTIFY_FLAGS "-D_FORTIFY_SOURCE=2")
-        endif()
+    # GCC 12+ with glibc 2.31+ automatically enables FORTIFY_SOURCE=3
+    # Explicitly defining FORTIFY_SOURCE=2 causes conflicts and disables protection
+    # Solution: Don't explicitly define for GCC 12+, let system use default
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "12.0")
+        # GCC 12+: Use system default FORTIFY_SOURCE=3
+        set(FORTIFY_FLAGS "")
     else()
+        # GCC 11 and earlier: Explicitly define FORTIFY_SOURCE=2
         set(FORTIFY_FLAGS "-D_FORTIFY_SOURCE=2")
     endif()
 
@@ -41,8 +32,6 @@ else()
         string(REPLACE "-O2" "-O0" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
         string(REPLACE "-D_FORTIFY_SOURCE=2" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
         string(REPLACE "-D_FORTIFY_SOURCE=2" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-        string(REPLACE "-U_FORTIFY_SOURCE" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
-        string(REPLACE "-U_FORTIFY_SOURCE" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
     endif()
     set(CMAKE_SHARED_LINKER_FLAGS "${SECURE_SHARED_LINKER_FLAGS} ${CMAKE_SHARED_LINKER_FLAGS}")
     set(CMAKE_EXE_LINKER_FLAGS "${SECURE_EXE_LINKER_FLAGS} ${CMAKE_EXE_LINKER_FLAGS}")
